@@ -41,19 +41,19 @@ Output: `lubawa_z12_combined.png` in the script folder.
 ## Examples
 
 
-# Scheme 2 (gray-to-red reflectivity scale)
+## Scheme 2 (gray-to-red reflectivity scale)
 python generate_place_image.py "Warszawa" --scheme 2
 
-# Specific elevation, tighter view
+## Specific elevation, tighter view
 python generate_place_image.py "Gdansk" --elev 1.5 --grid 3
 
-# Higher zoom, wider grid, custom output
+## Higher zoom, wider grid, custom output
 python generate_place_image.py "Krakow" --zoom 13 --grid 5 -o C:\Users\Public
 
-# Boost labels more for readability
+## Boost labels more for readability
 python generate_place_image.py "Liberec" --label-intensity 2.5
 
-# Disambiguate when multiple places match
+## Disambiguate when multiple places match
 python generate_place_image.py "Mokre" --index 1
 
 
