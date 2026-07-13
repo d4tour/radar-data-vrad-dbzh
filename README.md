@@ -70,7 +70,7 @@ Output
 _index_scan: a0 = (az[0] - step * 0.5) % 360	Shift ray reference backward from start
 _index_scan: a0 = (az[0] + step * AZIMUTH_OFFSET) % 360	Configurable offset
 parse_file(): prefer stopazA over startazA	Use sweep-end angle instead of sweep-start
-AZIMUTH_OFFSET = 0.0 param added then removed
+AZIMUTH_OFFSET = 0.0 param 
 Net sum currently: a0 = az[0] + startazA only = 0° shift 
 - a0 = az[0] 
 - uses startazA only 
