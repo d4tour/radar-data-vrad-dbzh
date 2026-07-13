@@ -13,6 +13,7 @@ from PIL import Image
 from pyproj import Geod
 
 S3_BASE = "https://s3.waw3-1.cloudferro.com/openradar-24h"
+ARCHIVE_BASE = "https://s3.waw3-1.cloudferro.com/openradar-archive"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -164,10 +165,6 @@ COUNTRY_CONFIG = {
     "si": {"dir": "PVOL", "separate_elevations": False},
 }
 
-# Azimuth offset in ray units (+ = CW, - = CCW). Tweak if data appears rotated.
-# Example: 0.5 shifts by half a ray width (~0.5 deg for 360-ray scans).
-AZIMUTH_OFFSET = 0.0  # <- change this value
-
 VARIABLES = {
     "DBZH": {"label": "Reflectivity", "unit": "dBZ", "vmin": 0, "vmax": 70},
     "VRADH": {"label": "Radial Velocity", "unit": "m/s", "vmin": -50, "vmax": 50},
@@ -246,6 +243,28 @@ def list_s3(prefix):
         if marker:
             url += f"&marker={marker}"
         resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for contents in root.findall("s3:Contents", ns):
+            key = contents.find("s3:Key", ns).text
+            keys.append(key)
+        is_truncated = root.find("s3:IsTruncated", ns)
+        if is_truncated is None or is_truncated.text != "true":
+            break
+        next_marker = root.find("s3:NextMarker", ns)
+        marker = next_marker.text if next_marker is not None else keys[-1]
+    return keys
+
+
+def list_s3_archive(prefix):
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    keys = []
+    marker = None
+    while True:
+        url = f"{ARCHIVE_BASE}/?prefix={prefix}&max-keys=1000"
+        if marker:
+            url += f"&marker={marker}"
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
         for contents in root.findall("s3:Contents", ns):
@@ -360,8 +379,21 @@ def _ensure_elevation(elevation):
     return el
 
 
-def latest_key(station, variable="DBZH", elevation=None):
-    cache_key = f"{station}:{variable}:{elevation}"
+def _extract_ts(key):
+    m = re.search(r'@(\d{8}T\d{4})@', key or "")
+    return m.group(1) if m else ""
+
+
+def _ts_to_dt(ts_str):
+    try:
+        return datetime(int(ts_str[0:4]), int(ts_str[4:6]), int(ts_str[6:8]),
+                        int(ts_str[9:11]), int(ts_str[11:13]), tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def latest_key(station, variable="DBZH", elevation=None, target_time=None):
+    cache_key = f"{station}:{variable}:{elevation}:{target_time}"
     now = time.time()
     if cache_key in _latest_key_cache:
         entry = _latest_key_cache[cache_key]
@@ -373,29 +405,32 @@ def latest_key(station, variable="DBZH", elevation=None):
     sep = _get_station_separate(station)
     if sep is None:
         sep = cfg["separate_elevations"]
-    today = datetime.now(timezone.utc).strftime("%Y/%m/%d")
-    prefix = f"{today}/{cc_upper}/{station}/{cfg['dir']}/"
-    keys = list_s3(prefix)
-    if sep and elevation is not None:
-        elev_str = _ensure_elevation(elevation)
-        var_keys = [k for k in keys if f"@{elev_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
-    else:
-        var_keys = [k for k in keys if f"@{variable}" in k and k.endswith(".h5")]
-    if not var_keys:
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y/%m/%d")
-        prefix = f"{yesterday}/{cc_upper}/{station}/{cfg['dir']}/"
-        keys = list_s3(prefix)
+    ref_time = target_time if target_time is not None else datetime.now(timezone.utc)
+    all_var_keys = []
+    for days_ago in range(3):
+        d = (ref_time - timedelta(days=days_ago)).strftime("%Y/%m/%d")
+        try:
+            prefix = f"{d}/{cc_upper}/{station}/{cfg['dir']}/"
+            keys = list_s3(prefix)
+        except Exception:
+            continue
         if sep and elevation is not None:
-            var_keys = [k for k in keys if f"@{elev_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
+            elev_str = _ensure_elevation(elevation)
+            vk = [k for k in keys if f"@{elev_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
         else:
-            var_keys = [k for k in keys if f"@{variable}" in k and k.endswith(".h5")]
+            vk = [k for k in keys if f"@{variable}" in k and k.endswith(".h5")]
+        all_var_keys.extend(vk)
     result = None
-    if var_keys:
-        def extract_ts(key):
-            m = re.search(r'@(\d{8}T\d{4})@', key)
-            return m.group(1) if m else ""
-        var_keys.sort(key=extract_ts, reverse=True)
-        result = var_keys[0]
+    if all_var_keys:
+        if target_time is not None:
+            def _ts_diff(key):
+                ts = _extract_ts(key)
+                dt = _ts_to_dt(ts) if ts else None
+                return abs((dt - target_time).total_seconds()) if dt else float('inf')
+            all_var_keys.sort(key=_ts_diff)
+        else:
+            all_var_keys.sort(key=_extract_ts, reverse=True)
+        result = all_var_keys[0]
     _latest_key_cache[cache_key] = {"key": result, "time": now}
     return result
 
@@ -411,14 +446,16 @@ def fetch_and_parse(key):
             return cache_fp
         except Exception:
             os.remove(cache_fp)
-    url = f"{S3_BASE}/{key}"
-    resp = requests.get(url, timeout=30)
+    for base in [S3_BASE, ARCHIVE_BASE]:
+        url = f"{base}/{key}"
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            tmp = cache_fp + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(resp.content)
+            os.replace(tmp, cache_fp)
+            return cache_fp
     resp.raise_for_status()
-    tmp = cache_fp + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(resp.content)
-    os.replace(tmp, cache_fp)
-    return cache_fp
 
 
 def parse_file(filepath):
@@ -449,16 +486,11 @@ def parse_file(filepath):
             data_f = data_f * gain + offset
             data_f[mask] = np.nan
             if f"{g}/how" in f and "startazA" in f[f"{g}/how"].attrs:
-                start_az = f[f"{g}/how"].attrs["startazA"][:].astype(np.float32)
-                if len(start_az) != nrays:
+                az = f[f"{g}/how"].attrs["startazA"][:].astype(np.float32) % 360
+                if len(az) != nrays:
                     step = 360.0 / nrays
                     a1gate_val = int(where.get("a1gate", 0))
                     az = (np.arange(nrays, dtype=np.float32) * step + a1gate_val) % 360
-                else:
-                    if "stopazA" in f[f"{g}/how"].attrs:
-                        az = f[f"{g}/how"].attrs["stopazA"][:].astype(np.float32) % 360
-                    else:
-                        az = start_az % 360
             else:
                 step = 360.0 / nrays
                 a1gate_val = int(where.get("a1gate", 0))
@@ -491,7 +523,7 @@ def get_parsed(key):
 def _index_scan(az, rng, data, fwd_az, dist, method="nearest"):
     nrays = len(az)
     step = 360.0 / nrays
-    a0 = (az[0] + step * AZIMUTH_OFFSET) % 360
+    a0 = az[0]
     if method == "linear":
         ray_frac = ((fwd_az - a0) % 360) / step
         ray0 = np.floor(ray_frac).astype(np.int32) % nrays

@@ -249,6 +249,7 @@ def _is_stale(ts_str, max_minutes=30):
 
 
 def get_keys_for_time(station, variable, dt, elevation=None):
+    from radar_server import list_s3_archive, ARCHIVE_BASE
     country = _station_country(station)
     cfg = COUNTRY_CONFIG[country]
     cc_upper = country.upper()
@@ -256,36 +257,43 @@ def get_keys_for_time(station, variable, dt, elevation=None):
     if sep is None:
         sep = cfg["separate_elevations"]
     prefix = f"{dt.strftime('%Y/%m/%d')}/{cc_upper}/{station}/{cfg['dir']}/"
-    keys = list_s3(prefix)
-    ts_str = dt.strftime("%Y%m%dT%H%M")
-    if sep and elevation is not None:
-        elev_str = _ensure_elevation(elevation)
-        var_keys = [k for k in keys if f"@{ts_str}@" in k and f"@{elev_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
-    else:
-        var_keys = [k for k in keys if f"@{ts_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
-    if not var_keys:
-        def ts_diff(key):
-            m = re.search(r'@(\d{8}T\d{4})@', key)
-            if m:
-                try:
-                    kt = datetime.strptime(m.group(1), "%Y%m%dT%H%M").replace(tzinfo=timezone.utc)
-                    return abs((kt - dt).total_seconds())
-                except:
-                    return float('inf')
-            return float('inf')
-        var_keys = [k for k in keys if f"@{variable}" in k and k.endswith(".h5")]
-        var_keys.sort(key=ts_diff)
-        if var_keys and ts_diff(var_keys[0]) <= 900:
-            print(f"       Exact time not found, using closest ({_extract_timestamp(var_keys[0])})")
+    for s3_fn in [list_s3, list_s3_archive]:
+        try:
+            keys = s3_fn(prefix)
+        except Exception:
+            continue
+        ts_str = dt.strftime("%Y%m%dT%H%M")
+        if sep and elevation is not None:
+            elev_str = _ensure_elevation(elevation)
+            var_keys = [k for k in keys if f"@{ts_str}@" in k and f"@{elev_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
+        else:
+            var_keys = [k for k in keys if f"@{ts_str}@" in k and f"@{variable}" in k and k.endswith(".h5")]
+        if not var_keys:
+            def ts_diff(key):
+                m = re.search(r'@(\d{8}T\d{4})@', key)
+                if m:
+                    try:
+                        kt = datetime.strptime(m.group(1), "%Y%m%dT%H%M").replace(tzinfo=timezone.utc)
+                        return abs((kt - dt).total_seconds())
+                    except:
+                        return float('inf')
+                return float('inf')
+            var_keys = [k for k in keys if f"@{variable}" in k and k.endswith(".h5")]
+            var_keys.sort(key=ts_diff)
+            if var_keys and ts_diff(var_keys[0]) <= 900:
+                print(f"       Exact time not found, using closest ({_extract_timestamp(var_keys[0])})")
+                return var_keys[0]
+        if var_keys:
             return var_keys[0]
-        return None
+    return None
     return var_keys[0]
 
 
 def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
                          label_intensity=1.8, colorscheme="1", output_dir=None,
                          place_lat=None, place_lon=None, station_override=None,
-                         target_time=None, basemap="dark", opacity=None):
+                         target_time=None, basemap="dark", opacity=None,
+                         variable="both"):
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(__file__))
     _init_fonts()
@@ -332,20 +340,41 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
     print(f"       Available elevations: {elevs}")
     print(f"       Using elevation: {default_elev}")
 
-    if target_time:
-        dbzh_key = get_keys_for_time(station_id, "DBZH", target_time, default_elev if sep else None)
-        vel_var = "VRADH"
-        vel_key = get_keys_for_time(station_id, vel_var, target_time, default_elev if sep else None)
-        if not vel_key:
-            vel_var = "VRAD"
-            vel_key = get_keys_for_time(station_id, vel_var, target_time, default_elev if sep else None)
+    from radar_server import _extract_ts, _ts_to_dt
+
+    want_dbzh = variable in ("DBZH", "both")
+    want_vel = variable in ("VRADH", "both")
+
+    if want_dbzh:
+        if target_time:
+            dbzh_key = get_keys_for_time(station_id, "DBZH", target_time, default_elev if sep else None)
+        else:
+            dbzh_key = latest_key(station_id, "DBZH", default_elev if sep else None)
+        dbzh_ts = _extract_ts(dbzh_key)
     else:
-        dbzh_key = latest_key(station_id, "DBZH", default_elev if sep else None)
+        dbzh_key = None
+        dbzh_ts = None
+
+    sub_target = _ts_to_dt(dbzh_ts) if dbzh_ts else target_time
+
+    if want_vel:
+        if target_time:
+            vel_var = "VRADH"
+            vel_key = get_keys_for_time(station_id, vel_var, sub_target or target_time, default_elev if sep else None)
+            if not vel_key:
+                vel_var = "VRAD"
+                vel_key = get_keys_for_time(station_id, vel_var, sub_target or target_time, default_elev if sep else None)
+        else:
+            vel_var = "VRADH"
+            vel_key = latest_key(station_id, vel_var, default_elev if sep else None, target_time=sub_target)
+            if not vel_key:
+                vel_var = "VRAD"
+                vel_key = latest_key(station_id, vel_var, default_elev if sep else None, target_time=sub_target)
+        vel_ts = _extract_ts(vel_key)
+    else:
+        vel_key = None
+        vel_ts = None
         vel_var = "VRADH"
-        vel_key = latest_key(station_id, vel_var, default_elev if sep else None)
-        if not vel_key:
-            vel_var = "VRAD"
-            vel_key = latest_key(station_id, vel_var, default_elev if sep else None)
 
     print(f"       DBZH key: {dbzh_key or 'N/A'}")
     print(f"       {vel_var} key: {vel_key or 'N/A'}")
@@ -356,14 +385,8 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
     dbzh_parsed = get_parsed(dbzh_key) if dbzh_key else None
     vel_parsed = get_parsed(vel_key) if vel_key else None
 
-    def extract_ts(key):
-        m = re.search(r'@(\d{8}T\d{4})@', key or "")
-        return m.group(1) if m else "N/A"
-
-    dbzh_ts = extract_ts(dbzh_key)
-    vel_ts = extract_ts(vel_key)
-    latest_ts = dbzh_ts if dbzh_ts != "N/A" else vel_ts
-    if vel_ts != "N/A" and vel_ts > latest_ts:
+    latest_ts = dbzh_ts if dbzh_ts and dbzh_ts != "N/A" else vel_ts
+    if vel_ts and vel_ts != "N/A" and (latest_ts is None or vel_ts > latest_ts):
         latest_ts = vel_ts
 
     time_str = _parse_ts_to_utc2(latest_ts)
@@ -371,11 +394,11 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
     no_data_dbzh = False
     no_data_vel = False
     if not target_time:
-        if dbzh_key and _is_stale(dbzh_ts, 30):
+        if want_dbzh and dbzh_key and _is_stale(dbzh_ts, 30):
             print(f"       WARNING: DBZH data is older than 30 min ({dbzh_ts})")
             dbzh_parsed = None
             no_data_dbzh = True
-        if vel_key and _is_stale(vel_ts, 30):
+        if want_vel and vel_key and _is_stale(vel_ts, 30):
             print(f"       WARNING: {vel_var} data is older than 30 min ({vel_ts})")
             vel_parsed = None
             no_data_vel = True
@@ -412,8 +435,8 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
         labels = None
         if bm["labels_url"]:
             labels = _boost_labels(fetch_tile(bm["labels_url"], zoom, x, y, (0, 0, 0, 0)), label_intensity)
-        dbzh_t = render_radar_tile(dbzh_parsed, dbzh_elev_idx, zoom, x, y, "DBZH", colorscheme) if dbzh_parsed else None
-        vel_t = render_radar_tile(vel_parsed, vel_elev_idx, zoom, x, y, vel_var) if vel_parsed else None
+        dbzh_t = render_radar_tile(dbzh_parsed, dbzh_elev_idx, zoom, x, y, "DBZH", colorscheme) if dbzh_parsed and want_dbzh else None
+        vel_t = render_radar_tile(vel_parsed, vel_elev_idx, zoom, x, y, vel_var) if vel_parsed and want_vel else None
         return x, y, base, labels, dbzh_t, vel_t
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -427,8 +450,15 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
     panel_w = grid_size * T
     panel_h = grid_size * T
 
-    dbzh_canvas = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0))
-    vel_canvas = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0))
+    num_panels = (1 if want_dbzh else 0) + (1 if want_vel else 0)
+    gap = 4
+    header_h = 58
+    bottom_h = 50
+    total_w = panel_w * num_panels + (gap if num_panels > 1 else 0)
+    total_h = header_h + panel_h + bottom_h
+
+    dbzh_canvas = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0)) if want_dbzh else None
+    vel_canvas = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0)) if want_vel else None
 
     for x in tile_xs:
         for y in tile_ys:
@@ -441,107 +471,118 @@ def generate_place_image(place_name, zoom=12, grid_size=5, elevation=None,
             dbzh_t = dbzh_t or Image.new("RGBA", (T, T), (0, 0, 0, 0))
             vel_t = vel_t or Image.new("RGBA", (T, T), (0, 0, 0, 0))
 
-            for canvas, radar_tile in [(dbzh_canvas, dbzh_t), (vel_canvas, vel_t)]:
-                panel = Image.new("RGBA", (T, T), (0, 0, 0, 0))
-                panel.paste(base, (0, 0), base)
-                panel = Image.alpha_composite(panel, _apply_opacity(radar_tile, opacity))
+            for canvas, radar_tile in (
+                [(dbzh_canvas, dbzh_t)] if want_dbzh else []
+            ) + (
+                [(vel_canvas, vel_t)] if want_vel else []
+            ):
+                panel_img = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+                panel_img.paste(base, (0, 0), base)
+                panel_img = Image.alpha_composite(panel_img, _apply_opacity(radar_tile, opacity))
                 if labels:
-                    panel = Image.alpha_composite(panel, labels)
-                canvas.paste(panel, (px, py), panel)
+                    panel_img = Image.alpha_composite(panel_img, labels)
+                canvas.paste(panel_img, (px, py), panel_img)
 
     print(f"[7/7] Assembling final image...")
-    dbzh_rgb = Image.new("RGB", dbzh_canvas.size, (0, 0, 0))
-    dbzh_rgb.paste(dbzh_canvas, (0, 0), dbzh_canvas)
-    vel_rgb = Image.new("RGB", vel_canvas.size, (0, 0, 0))
-    vel_rgb.paste(vel_canvas, (0, 0), vel_canvas)
-
-    gap = 4
-    header_h = 58
-    bottom_h = 50
-    total_w = panel_w * 2 + gap
-    total_h = header_h + panel_h + bottom_h
-
     final = Image.new("RGB", (total_w, total_h), (0, 0, 0))
     draw = ImageDraw.Draw(final)
 
-    final.paste(dbzh_rgb, (0, header_h))
-    final.paste(vel_rgb, (panel_w + gap, header_h))
-
-    no_data_font = _open_font(32)
-    no_data_color = (180, 180, 180)
-    for panel_name, panel_nodata, panel_x in [
-        ("DBZH", no_data_dbzh, 0), (vel_var, no_data_vel, panel_w + gap)
+    panel_offset = 0
+    for pname, pcanvas, p_nodata in [
+        ("DBZH", dbzh_canvas, no_data_dbzh),
+        (vel_var, vel_canvas, no_data_vel)
     ]:
-        if panel_nodata:
-            nd_text = f"No data"
+        if pcanvas is None:
+            continue
+        prgb = Image.new("RGB", pcanvas.size, (0, 0, 0))
+        prgb.paste(pcanvas, (0, 0), pcanvas)
+        final.paste(prgb, (panel_offset, header_h))
+
+        no_data_font = _open_font(32)
+        no_data_color = (180, 180, 180)
+        if p_nodata:
+            nd_text = "No data"
             nd_bbox = draw.textbbox((0, 0), nd_text, font=no_data_font)
             nd_w = nd_bbox[2] - nd_bbox[0]
             nd_h = nd_bbox[3] - nd_bbox[1]
-            nd_x = panel_x + (panel_w - nd_w) // 2
+            nd_x = panel_offset + (panel_w - nd_w) // 2
             nd_y = header_h + (panel_h - nd_h) // 2
             draw.text((nd_x, nd_y), nd_text, fill=no_data_color, font=no_data_font)
 
-    draw.rectangle([(0, 0), (panel_w, header_h)], fill=bm["bar_bg"])
-    draw.rectangle([(panel_w + gap, 0), (total_w, header_h)], fill=bm["bar_bg"])
+        draw.rectangle([(panel_offset, 0), (panel_offset + panel_w, header_h)], fill=bm["bar_bg"])
 
-    l_margin = 16
-    l_bar_h = 26
-    l_bar_y = (header_h - l_bar_h) // 2 - 4
-    l_bar_w = panel_w - l_margin * 2
+        l_margin = 16
+        l_bar_h = 26
+        l_bar_y = (header_h - l_bar_h) // 2 - 4
+        l_bar_w = panel_w - l_margin * 2
+        scheme = colorscheme if pname == "DBZH" else "1"
+        _draw_legend_bar(final, draw, panel_offset + l_margin, l_bar_y, l_bar_w, l_bar_h, pname, scheme)
 
-    _draw_legend_bar(final, draw, l_margin, l_bar_y, l_bar_w, l_bar_h, "DBZH", colorscheme)
-    _draw_legend_bar(final, draw, panel_w + gap + l_margin, l_bar_y, l_bar_w, l_bar_h, vel_var)
+        panel_offset += panel_w + gap
 
     bar_y = header_h + panel_h
     draw.rectangle([(0, bar_y), (total_w, total_h)], fill=bm["bar_bg"])
 
-    station_str = f"{info['name']} ({info['country'].upper()})"
-    left_line = f"{station_str}  {time_str}  DBZH"
-    right_line = f"{station_str}  {time_str}  {vel_var}"
-
     one_line_font = _open_font(26)
     text_y = bar_y + (bottom_h - 30) // 2
-
     margin = 14
-    mid_gap_start = panel_w + gap
 
-    lbbox = draw.textbbox((0, 0), left_line, font=one_line_font)
-    lw = lbbox[2] - lbbox[0]
-    rbbox = draw.textbbox((0, 0), right_line, font=one_line_font)
-    rw = rbbox[2] - rbbox[0]
-    cbbox = draw.textbbox((0, 0), place_name, font=one_line_font)
-    cw = cbbox[2] - cbbox[0]
+    lines = []
+    if want_dbzh:
+        lines.append(f"{info['name']} ({info['country'].upper()})  {time_str}  DBZH")
+    if want_vel:
+        lines.append(f"{info['name']} ({info['country'].upper()})  {time_str}  {vel_var}")
 
-    max_left_x = margin + lw
-    min_right_x = total_w - margin - rw
-    city_center_x = (total_w - cw) // 2
-    city_left_edge = city_center_x
-    city_right_edge = city_center_x + cw
-
-    if max_left_x > city_left_edge or min_right_x < city_right_edge:
-        max_station = 12
-        short_station = info['name'][:max_station] + ".." if len(info['name']) > max_station else info['name']
-        station_str = f"{short_station} ({info['country'].upper()})"
-        left_line = f"{station_str}  {time_str}  DBZH"
-        right_line = f"{station_str}  {time_str}  {vel_var}"
-
-    draw.text((margin, text_y), left_line, fill=bm["bar_text"], font=one_line_font)
-
-    rbbox2 = draw.textbbox((0, 0), right_line, font=one_line_font)
-    rw2 = rbbox2[2] - rbbox2[0]
-    draw.text((total_w - margin - rw2, text_y), right_line, fill=bm["bar_text"], font=one_line_font)
-
-    cbbox2 = draw.textbbox((0, 0), place_name, font=one_line_font)
-    cw2 = cbbox2[2] - cbbox2[0]
-    draw.text(((total_w - cw2) // 2, text_y), place_name, fill=bm["accent"], font=one_line_font)
+    if num_panels == 1:
+        line = lines[0]
+        lbbox = draw.textbbox((0, 0), line, font=one_line_font)
+        lw = lbbox[2] - lbbox[0]
+        cbbox = draw.textbbox((0, 0), place_name, font=one_line_font)
+        cw = cbbox[2] - cbbox[0]
+        max_left_allowed = margin + lw
+        if max_left_allowed > total_w - margin - cw - margin:
+            max_station = 12
+            short_station = info['name'][:max_station] + ".." if len(info['name']) > max_station else info['name']
+            line = f"{short_station} ({info['country'].upper()})  {time_str}  {'DBZH' if want_dbzh else vel_var}"
+            lbbox = draw.textbbox((0, 0), line, font=one_line_font)
+            lw = lbbox[2] - lbbox[0]
+        draw.text((margin, text_y), line, fill=bm["bar_text"], font=one_line_font)
+        cbbox2 = draw.textbbox((0, 0), place_name, font=one_line_font)
+        cw2 = cbbox2[2] - cbbox2[0]
+        draw.text(((total_w - cw2) // 2, text_y), place_name, fill=bm["accent"], font=one_line_font)
+    else:
+        left_line, right_line = lines
+        lbbox = draw.textbbox((0, 0), left_line, font=one_line_font)
+        lw = lbbox[2] - lbbox[0]
+        rbbox = draw.textbbox((0, 0), right_line, font=one_line_font)
+        rw = rbbox[2] - rbbox[0]
+        cbbox = draw.textbbox((0, 0), place_name, font=one_line_font)
+        cw = cbbox[2] - cbbox[0]
+        max_left_x = margin + lw
+        min_right_x = total_w - margin - rw
+        city_center_x = (total_w - cw) // 2
+        if max_left_x > city_center_x or (city_center_x + cw) > min_right_x:
+            max_station = 12
+            short_station = info['name'][:max_station] + ".." if len(info['name']) > max_station else info['name']
+            station_str = f"{short_station} ({info['country'].upper()})"
+            left_line = f"{station_str}  {time_str}  DBZH"
+            right_line = f"{station_str}  {time_str}  {vel_var}"
+        draw.text((margin, text_y), left_line, fill=bm["bar_text"], font=one_line_font)
+        rbbox2 = draw.textbbox((0, 0), right_line, font=one_line_font)
+        rw2 = rbbox2[2] - rbbox2[0]
+        draw.text((total_w - margin - rw2, text_y), right_line, fill=bm["bar_text"], font=one_line_font)
+        cbbox2 = draw.textbbox((0, 0), place_name, font=one_line_font)
+        cw2 = cbbox2[2] - cbbox2[0]
+        draw.text(((total_w - cw2) // 2, text_y), place_name, fill=bm["accent"], font=one_line_font)
 
     station_short = station_id[2:].lower()
     elapsed = time.time() - t_start
     safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', place_name.lower())
-    output_path = os.path.join(output_dir, f"{safe_name}_z{zoom}_combined_{station_short}.png")
+    var_tag = variable.lower()
+    output_path = os.path.join(output_dir, f"{safe_name}_z{zoom}_{var_tag}_{station_short}.png")
     n = 1
     while os.path.exists(output_path):
-        output_path = os.path.join(output_dir, f"{safe_name}_z{zoom}_combined_{n}_{station_short}.png")
+        output_path = os.path.join(output_dir, f"{safe_name}_z{zoom}_{var_tag}_{n}_{station_short}.png")
         n += 1
     final.save(output_path, "PNG")
     print(f"\n{'='*60}")
@@ -566,6 +607,8 @@ def main():
     parser.add_argument("--station", default=None, help="Radar station ID (e.g. plrze, plleg). Overrides closest-station logic.")
     parser.add_argument("--opacity", type=float, default=None,
                         help="Radar overlay opacity 0-1 (e.g. 0.5 for 50%% transparency, default: 1.0)")
+    parser.add_argument("--var", type=str, default="both", choices=["DBZH", "VRADH", "both"],
+                        help="Which variable to show: DBZH, VRADH, or both (default: both)")
     parser.add_argument("--time", type=str, default=None,
                         help="Specific timestamp in UTC: YYYYMMDDHHMM (e.g. 202606301005). Renders historical frame instead of latest.")
     group = parser.add_mutually_exclusive_group()
@@ -610,7 +653,8 @@ def main():
                          place_lat=place_lat, place_lon=place_lon,
                          station_override=args.station,
                          target_time=target_time,
-                         basemap=basemap, opacity=args.opacity)
+                         basemap=basemap, opacity=args.opacity,
+                         variable=args.var)
 
 
 if __name__ == "__main__":
